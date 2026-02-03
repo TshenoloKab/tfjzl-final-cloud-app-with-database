@@ -1,24 +1,147 @@
-from django.urls import path
-from django.conf import settings
-from django.conf.urls.static import static
-from . import views
+from django.shortcuts import render, get_object_or_404, redirect
+from django.http import HttpResponseRedirect
+from django.urls import reverse
+from django.views import generic
+from django.contrib.auth import login, logout, authenticate
+from django.contrib.auth.models import User
+import logging
 
-app_name = 'onlinecourse'
-urlpatterns = [
-    # route is a string contains a URL pattern
-    # view refers to the view function
-    # name the URL
-    path(route='', view=views.CourseListView.as_view(), name='index'),
-    path('registration/', views.registration_request, name='registration'),
-    path('login/', views.login_request, name='login'),
-    path('logout/', views.logout_request, name='logout'),
-    # ex: /onlinecourse/5/
-    path('<int:pk>/', views.CourseDetailView.as_view(), name='course_details'),
-    # ex: /enroll/5/
-    path('<int:course_id>/enroll/', views.enroll, name='enroll'),
+# Import models
+from .models import Course, Enrollment, Question, Choice, Submission
 
-    # <HINT> Create a route for submit view
+logger = logging.getLogger(__name__)
 
-    # <HINT> Create a route for show_exam_result view
 
- ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+def registration_request(request):
+    context = {}
+    if request.method == 'GET':
+        return render(request, 'onlinecourse/user_registration_bootstrap.html', context)
+    elif request.method == 'POST':
+        username = request.POST['username']
+        password = request.POST['psw']
+        first_name = request.POST['firstname']
+        last_name = request.POST['lastname']
+
+        try:
+            User.objects.get(username=username)
+            context['message'] = "User already exists."
+            return render(request, 'onlinecourse/user_registration_bootstrap.html', context)
+        except User.DoesNotExist:
+            user = User.objects.create_user(
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                password=password
+            )
+            login(request, user)
+            return redirect("onlinecourse:index")
+
+
+def login_request(request):
+    context = {}
+    if request.method == "POST":
+        username = request.POST['username']
+        password = request.POST['psw']
+        user = authenticate(username=username, password=password)
+        if user:
+            login(request, user)
+            return redirect('onlinecourse:index')
+        else:
+            context['message'] = "Invalid username or password."
+    return render(request, 'onlinecourse/user_login_bootstrap.html', context)
+
+
+def logout_request(request):
+    logout(request)
+    return redirect('onlinecourse:index')
+
+
+def check_if_enrolled(user, course):
+    if user.is_authenticated:
+        return Enrollment.objects.filter(user=user, course=course).exists()
+    return False
+
+
+class CourseListView(generic.ListView):
+    template_name = 'onlinecourse/course_list_bootstrap.html'
+    context_object_name = 'course_list'
+
+    def get_queryset(self):
+        user = self.request.user
+        courses = Course.objects.order_by('-total_enrollment')[:10]
+        for course in courses:
+            course.is_enrolled = check_if_enrolled(user, course)
+        return courses
+
+
+class CourseDetailView(generic.DetailView):
+    model = Course
+    template_name = 'onlinecourse/course_detail_bootstrap.html'
+
+
+def enroll(request, course_id):
+    course = get_object_or_404(Course, pk=course_id)
+    user = request.user
+
+    if user.is_authenticated and not check_if_enrolled(user, course):
+        Enrollment.objects.create(user=user, course=course, mode='honor')
+        course.total_enrollment += 1
+        course.save()
+
+    return HttpResponseRedirect(reverse('onlinecourse:course_details', args=(course.id,)))
+
+
+# -----------------------------
+# EXAM SUBMISSION
+# -----------------------------
+def extract_answers(request):
+    submitted_answers = []
+    for key in request.POST:
+        if key.startswith('choice'):
+            submitted_answers.append(int(request.POST[key]))
+    return submitted_answers
+
+
+def submit(request, course_id):
+    course = get_object_or_404(Course, pk=course_id)
+    user = request.user
+
+    enrollment = Enrollment.objects.get(user=user, course=course)
+    submission = Submission.objects.create(enrollment=enrollment)
+
+    choices = extract_answers(request)
+    submission.choices.set(choices)
+
+    return HttpResponseRedirect(
+        reverse(
+            viewname='onlinecourse:exam_result',
+            args=(course_id, submission.id)
+        )
+    )
+
+
+# -----------------------------
+# EXAM RESULT
+# -----------------------------
+def show_exam_result(request, course_id, submission_id):
+    context = {}
+
+    course = get_object_or_404(Course, pk=course_id)
+    submission = Submission.objects.get(id=submission_id)
+    selected_choices = submission.choices.all()
+
+    total_score = 0
+    questions = course.question_set.all()
+
+    for question in questions:
+        correct_choices = question.choice_set.filter(is_correct=True)
+        chosen = selected_choices.filter(question=question)
+
+        if set(correct_choices) == set(chosen):
+            total_score += question.grade
+
+    context['course'] = course
+    context['grade'] = total_score
+    context['choices'] = selected_choices
+
+    return render(request, 'onlinecourse/exam_result_bootstrap.html', context)
